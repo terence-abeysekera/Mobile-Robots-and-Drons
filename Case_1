@@ -1,6 +1,6 @@
 Matlab Codes-Mobile Robots and Drons Case 1
 %% SAR Navigation — Scenario Script
-clc; clear; close all;
+clc; clear; close all; 
 
 %% ── 1. PARAMETERS ──────────────────────────────────────────────────────
 COLS        = 30;
