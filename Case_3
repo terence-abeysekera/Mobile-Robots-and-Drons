@@ -1,5 +1,5 @@
 %% SAR Navigation — Scenario Script Case 3
-clc; clear; close all;
+clc; clear; close all; 
 
 %% ── 1. PARAMETERS ──────────────────────────────────────────────────────
 COLS        = 30;
