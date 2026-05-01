@@ -1,0 +1,421 @@
+%% SAR Navigation — Scenario Script Case 4
+clc; clear; close all;
+
+%% ── 1. PARAMETERS ──────────────────────────────────────────────────────
+COLS        = 30;
+ROWS        = 20;
+
+robotR      = 0.4;
+inflR       = 1;
+dt          = 0.1;
+maxSteps    = 3000;
+goalTol     = 0.7;
+
+baseSpeed   = 0.65;
+maxTurn     = 1.4;
+pathGain    = 1.4;
+dynGain     = 0.65;
+wallGain    = 0.25;
+
+replanLook  = 2.5;
+replanCool  = 40;
+stuckWin    = 100;
+stuckThr    = 0.4;
+
+showEvery   = 3;
+
+useDyn1 = true;
+useDyn2 = true;
+useDyn3 = true;
+
+SAFE_SLOW_DIST = 2.0;
+SAFE_SLOW_SPEED = 0.15;
+BLOCK_MARGIN = 1.3;
+
+%% ── 2. BUILD OCCUPANCY GRID ────────────────────────────────────────────
+occ = zeros(ROWS, COLS);
+occ(1,   :) = 1;
+occ(ROWS,:) = 1;
+occ(:,   1) = 1;
+occ(:,COLS) = 1;
+
+occ(4:13,  8)  = 1;
+occ(7,   8:15) = 1;
+occ(11:17, 15) = 1;
+occ(14, 15:23) = 1;
+occ(4:9,  22)  = 1;
+occ(11:16,26)  = 1;
+occ(17, 5:10)  = 1;
+occ(5:7,  12)  = 1;
+
+%% ── 3. INFLATE OBSTACLES ───────────────────────────────────────────────
+occInf = inflateMap(occ, inflR);
+
+%% ── 4. START / GOAL ────────────────────────────────────────────────────
+startXY = snapFree(occInf, [3 3],   'Start');
+goalXY  = snapFree(occInf, [27 17], 'Goal');
+
+%% ── 5. DIAGNOSTIC FIGURE ───────────────────────────────────────────────
+figure('Color','w','Name','Figure 1: Map Diagnostic');
+subplot(1,2,1);
+drawMap(occ);
+title('Raw map');
+hold on;
+plot(startXY(1), startXY(2), 'go','MarkerFaceColor','g','MarkerSize',9);
+plot(goalXY(1),  goalXY(2),  'mo','MarkerFaceColor','m','MarkerSize',9);
+
+subplot(1,2,2);
+drawMap(occInf);
+title(sprintf('Inflated map (inflR=%d)', inflR));
+hold on;
+plot(startXY(1), startXY(2), 'go','MarkerFaceColor','g','MarkerSize',9);
+plot(goalXY(1),  goalXY(2),  'mo','MarkerFaceColor','m','MarkerSize',9);
+
+%% ── 6. INITIAL A* PLAN ─────────────────────────────────────────────────
+path = astarPlan(occInf, startXY, goalXY);
+if isempty(path)
+    fprintf('Start occ=%d  Goal occ=%d\n', occInf(startXY(2),startXY(1)), occInf(goalXY(2),goalXY(1)));
+    error('A* found no path. See diagnostic figure.');
+end
+subplot(1,2,2);
+plot(path(:,1), path(:,2), 'c-', 'LineWidth', 2);
+legend({'Start','Goal','A* path'}, 'Location','best');
+
+%% ── 7. DYNAMIC OBSTACLES ───────────────────────────────────────────────
+dyn1.pos  = [10 4];
+dyn1.vel  = [0 0.07];
+dyn1.r    = 0.9;
+dyn1.ylim = [3 17];
+
+dyn2.pos  = [18 14];
+dyn2.vel  = [0 -0.06];
+dyn2.r    = 0.9;
+dyn2.ylim = [6 16];
+
+dyn3.pos  = [27 10];
+dyn3.vel  = [0 0.09];
+dyn3.r    = 1.0;
+dyn3.ylim = [9 15];
+
+%% ── 8. ROBOT STATE ─────────────────────────────────────────────────────
+rx  = startXY(1);
+ry  = startXY(2);
+rth = atan2(goalXY(2)-ry, goalXY(1)-rx);
+
+traj = [rx ry];
+replanN    = 0;
+minDynClr  = inf;
+distTrav   = 0;
+d2gLog     = nan(maxSteps,1);
+lastReplan = -inf;
+success    = false;
+
+wpIdx = min(2, size(path,1));
+wpTol = 0.8;
+
+%% ── 9. NAVIGATION FIGURE ───────────────────────────────────────────────
+figure('Color','w','Name','Figure 2: Navigation');
+hold on; axis equal;
+xlim([1 COLS]); ylim([1 ROWS]);
+xlabel('X'); ylabel('Y');
+
+%% ── 10. MAIN LOOP ──────────────────────────────────────────────────────
+for k = 1:maxSteps
+
+    if useDyn1
+        dyn1.pos = dyn1.pos + dyn1.vel;
+        if dyn1.pos(2) > dyn1.ylim(2) || dyn1.pos(2) < dyn1.ylim(1)
+            dyn1.vel(2) = -dyn1.vel(2);
+            dyn1.pos = dyn1.pos + dyn1.vel;
+        end
+    end
+
+    if useDyn2
+        dyn2.pos = dyn2.pos + dyn2.vel;
+        if dyn2.pos(2) > dyn2.ylim(2) || dyn2.pos(2) < dyn2.ylim(1)
+            dyn2.vel(2) = -dyn2.vel(2);
+            dyn2.pos = dyn2.pos + dyn2.vel;
+        end
+    end
+
+    if useDyn3
+        dyn3.pos = dyn3.pos + dyn3.vel;
+        if dyn3.pos(2) > dyn3.ylim(2) || dyn3.pos(2) < dyn3.ylim(1)
+            dyn3.vel(2) = -dyn3.vel(2);
+            dyn3.pos = dyn3.pos + dyn3.vel;
+        end
+    end
+
+    blocked1 = useDyn1 && dynBlocks(path, [rx ry], dyn1, replanLook, BLOCK_MARGIN);
+    blocked2 = useDyn2 && dynBlocks(path, [rx ry], dyn2, replanLook, BLOCK_MARGIN);
+    blocked3 = useDyn3 && dynBlocks(path, [rx ry], dyn3, replanLook, BLOCK_MARGIN);
+
+    if (blocked1 || blocked2 || blocked3) && (k - lastReplan > replanCool)
+        occD = occInf;
+        if useDyn1, occD = addCircObs(occD, dyn1.pos, dyn1.r + robotR); end
+        if useDyn2, occD = addCircObs(occD, dyn2.pos, dyn2.r + robotR); end
+        if useDyn3, occD = addCircObs(occD, dyn3.pos, dyn3.r + robotR); end
+        np = astarPlan(occD, round([rx ry]), goalXY);
+        if ~isempty(np)
+            path = np; replanN = replanN + 1; lastReplan = k; wpIdx = min(2, size(path,1));
+        end
+    end
+
+    if k > stuckWin
+        recent = traj(max(1,end-stuckWin):end,:);
+        if norm(recent(end,:) - recent(1,:)) < stuckThr && (k - lastReplan > replanCool)
+            occD = occInf;
+            if useDyn1, occD = addCircObs(occD, dyn1.pos, dyn1.r + robotR); end
+            if useDyn2, occD = addCircObs(occD, dyn2.pos, dyn2.r + robotR); end
+            if useDyn3, occD = addCircObs(occD, dyn3.pos, dyn3.r + robotR); end
+            np = astarPlan(occD, round([rx ry]), goalXY);
+            if ~isempty(np)
+                path = np; replanN = replanN + 1; lastReplan = k; wpIdx = min(2, size(path,1));
+            end
+        end
+    end
+
+    if wpIdx > size(path,1), wp = goalXY; else, wp = path(wpIdx,:); end
+    if norm([rx ry] - wp) < wpTol && wpIdx < size(path,1)
+        wpIdx = wpIdx + 1; wp = path(wpIdx,:);
+    end
+
+    desH = atan2(wp(2)-ry, wp(1)-rx);
+    avH = 0; dList = [];
+
+    if useDyn1
+        dv1 = [rx ry] - dyn1.pos; dDst1 = norm(dv1) - dyn1.r; brg1 = atan2(dyn1.pos(2)-ry, dyn1.pos(1)-rx);
+        dList(end+1) = dDst1; %#ok<AGROW>
+        if dDst1 < 3 && abs(wrapPi(brg1 - rth)) < pi/2
+            ae1 = wrapPi(atan2(dv1(2), dv1(1)) - rth);
+            avH = avH + dynGain * (3 - max(dDst1, 0.05)) / 3 * sign(ae1);
+        end
+    end
+
+    if useDyn2
+        dv2 = [rx ry] - dyn2.pos; dDst2 = norm(dv2) - dyn2.r; brg2 = atan2(dyn2.pos(2)-ry, dyn2.pos(1)-rx);
+        dList(end+1) = dDst2; %#ok<AGROW>
+        if dDst2 < 3 && abs(wrapPi(brg2 - rth)) < pi/2
+            ae2 = wrapPi(atan2(dv2(2), dv2(1)) - rth);
+            avH = avH + dynGain * (3 - max(dDst2, 0.05)) / 3 * sign(ae2);
+        end
+    end
+
+    if useDyn3
+        dv3 = [rx ry] - dyn3.pos; dDst3 = norm(dv3) - dyn3.r; brg3 = atan2(dyn3.pos(2)-ry, dyn3.pos(1)-rx);
+        dList(end+1) = dDst3; %#ok<AGROW>
+        if dDst3 < 3 && abs(wrapPi(brg3 - rth)) < pi/2
+            ae3 = wrapPi(atan2(dv3(2), dv3(1)) - rth);
+            avH = avH + dynGain * (3 - max(dDst3, 0.05)) / 3 * sign(ae3);
+        end
+    end
+
+    if isempty(dList)
+        nearestDynDist = inf;
+    else
+        nearestDynDist = min(dList);
+        minDynClr = min(minDynClr, nearestDynDist);
+    end
+
+    wRep = [0 0]; pr = inflR + 0.6;
+    for ang = 0:pi/4:7*pi/4
+        px = rx + pr*cos(ang); py = ry + pr*sin(ang);
+        if occQuery(occInf, px, py), wRep = wRep - [cos(ang) sin(ang)]; end
+    end
+    if norm(wRep) > 1e-6
+        wRep = wRep / norm(wRep);
+        wE = wrapPi(atan2(wRep(2), wRep(1)) - rth);
+        avH = avH + wallGain * wE;
+    end
+
+    hE = wrapPi(desH - rth);
+    omega = clamp(pathGain*hE + avH, -maxTurn, maxTurn);
+
+    if abs(hE) > 0.65, v = 0.0; else, v = baseSpeed; end
+    if nearestDynDist < SAFE_SLOW_DIST, v = min(v, SAFE_SLOW_SPEED); end
+
+    thN = wrapPi(rth + omega*dt);
+    xN = rx + v*cos(thN)*dt;
+    yN = ry + v*sin(thN)*dt;
+
+    if ~segHit([rx ry], [xN yN], occInf, 30)
+        distTrav = distTrav + norm([xN-rx, yN-ry]);
+        rx = xN; ry = yN; rth = thN;
+    else
+        rth = wrapPi(rth + 0.8*maxTurn*sign(hE + 1e-6)*dt);
+    end
+
+    traj(end+1,:) = [rx ry]; %#ok<AGROW>
+
+    d2g = norm([goalXY(1)-rx, goalXY(2)-ry]);
+    d2gLog(k) = d2g;
+    if d2g < goalTol, success = true; break; end
+
+    if mod(k,showEvery)==0 || k==1
+        cla; drawMap(occInf); hold on;
+        plot(path(:,1), path(:,2), 'b--','LineWidth',1.5);
+        plot(traj(:,1), traj(:,2), 'r-','LineWidth',2);
+        plot(startXY(1), startXY(2), 'go','MarkerFaceColor','g','MarkerSize',8);
+        plot(goalXY(1), goalXY(2), 'mo','MarkerFaceColor','m','MarkerSize',8);
+
+        if useDyn1
+            viscircles(dyn1.pos, dyn1.r, 'Color', [.85 .33 .1], 'LineWidth', 1.5);
+            plot(dyn1.pos(1), dyn1.pos(2), 'o', 'Color', [.85 .33 .1], 'MarkerFaceColor', [.85 .33 .1], 'MarkerSize', 7);
+        end
+        if useDyn2
+            viscircles(dyn2.pos, dyn2.r, 'Color', [0.2 0.7 0.9], 'LineWidth', 1.5);
+            plot(dyn2.pos(1), dyn2.pos(2), 'o', 'Color', [0.2 0.7 0.9], 'MarkerFaceColor', [0.2 0.7 0.9], 'MarkerSize', 7);
+        end
+        if useDyn3
+            viscircles(dyn3.pos, dyn3.r, 'Color', [1.0 0.85 0.1], 'LineWidth', 1.5);
+            plot(dyn3.pos(1), dyn3.pos(2), 'o', 'Color', [1.0 0.85 0.1], 'MarkerFaceColor', [1.0 0.85 0.1], 'MarkerSize', 7);
+        end
+
+        drawRobot([rx ry rth], 0.8);
+        title(sprintf('Step %d | Replans %d | D2G %.1f', k, replanN, d2g));
+        drawnow;
+    end
+end
+
+%% ── 11. RESULTS ────────────────────────────────────────────────────────
+fprintf('\n===== RESULTS =====\n');
+fprintf('Success:           %d\n', success);
+fprintf('Steps:             %d\n', k);
+fprintf('Replans:           %d\n', replanN);
+fprintf('Dist travelled:    %.2f\n', distTrav);
+if isinf(minDynClr)
+    fprintf('Min dyn clearance: N/A\n');
+else
+    fprintf('Min dyn clearance: %.2f\n', minDynClr);
+end
+fprintf('Final d2g:         %.2f\n', d2gLog(k));
+
+figure('Color','w','Name','Figure 3: Distance to Goal');
+plot(d2gLog(1:k), 'LineWidth', 2); grid on;
+xlabel('Step'); ylabel('Distance to Goal');
+title('Distance to Goal vs Time');
+
+%% LOCAL FUNCTIONS
+function drawMap(occ)
+    nR = size(occ,1); nC = size(occ,2);
+    imagesc([1 nC],[1 nR], occ); colormap(gray); set(gca,'YDir','normal'); clim([0 1]);
+    axis equal tight; xlim([0.5 nC+0.5]); ylim([0.5 nR+0.5]);
+    xlabel('X'); ylabel('Y');
+end
+
+function tf = occQuery(occ,x,y)
+    c = round(x); r = round(y);
+    if c < 1 || c > size(occ,2) || r < 1 || r > size(occ,1), tf = true; return; end
+    tf = occ(r,c) ~= 0;
+end
+
+function tf = segHit(p1,p2,occ,n)
+    tf = false;
+    for i = 1:n
+        t = (i-1)/(n-1);
+        x = p1(1) + t*(p2(1)-p1(1)); y = p1(2) + t*(p2(2)-p1(2));
+        if occQuery(occ,x,y), tf = true; return; end
+    end
+end
+
+function out = inflateMap(occ,rad)
+    out = occ; [rs,cs] = find(occ==1);
+    for i = 1:numel(rs)
+        r = rs(i); c = cs(i);
+        for dr = -rad:rad
+            for dc = -rad:rad
+                nr = r + dr; nc = c + dc;
+                if nr >= 1 && nr <= size(occ,1) && nc >= 1 && nc <= size(occ,2)
+                    if dr^2 + dc^2 <= rad^2, out(nr,nc) = 1; end
+                end
+            end
+        end
+    end
+end
+
+function path = astarPlan(occ, sXY, gXY)
+    sXY = round(sXY); gXY = round(gXY);
+    nR = size(occ,1); nC = size(occ,2);
+    sXY = [clamp(sXY(1),1,nC) clamp(sXY(2),1,nR)];
+    gXY = [clamp(gXY(1),1,nC) clamp(gXY(2),1,nR)];
+    if occ(sXY(2),sXY(1)) ~= 0 || occ(gXY(2),gXY(1)) ~= 0, path = []; return; end
+    sc = sXY(1); sr = sXY(2); gc = gXY(1); gr = gXY(2);
+    g = inf(nR,nC); f = inf(nR,nC); par = zeros(nR,nC,2);
+    inOpen = false(nR,nC); inClosed = false(nR,nC);
+    g(sr,sc)=0; f(sr,sc)=norm([gc-sc, gr-sr]); inOpen(sr,sc)=true;
+    NB = [1 0;-1 0;0 1;0 -1;1 1;1 -1;-1 1;-1 -1];
+    CO = [1 1 1 1 sqrt(2) sqrt(2) sqrt(2) sqrt(2)];
+    while any(inOpen(:))
+        tmp = f; tmp(~inOpen)=inf; [~,id]=min(tmp(:)); [r,c]=ind2sub([nR nC],id);
+        if c==gc && r==gr
+            path=[c r];
+            while c~=sc || r~=sr
+                pc=par(r,c,1); pr=par(r,c,2); c=pc; r=pr; path=[c r; path]; %#ok<AGROW>
+            end
+            return;
+        end
+        inOpen(r,c)=false; inClosed(r,c)=true;
+        for n=1:8
+            nc2=c+NB(n,1); nr2=r+NB(n,2);
+            if nc2<1 || nc2>nC || nr2<1 || nr2>nR, continue; end
+            if occ(nr2,nc2)~=0 || inClosed(nr2,nc2), continue; end
+            if abs(NB(n,1))==1 && abs(NB(n,2))==1
+                if occ(r,nc2)~=0 || occ(nr2,c)~=0, continue; end
+            end
+            tg=g(r,c)+CO(n);
+            if ~inOpen(nr2,nc2)
+                inOpen(nr2,nc2)=true;
+            elseif tg>=g(nr2,nc2)
+                continue;
+            end
+            par(nr2,nc2,1)=c; par(nr2,nc2,2)=r;
+            g(nr2,nc2)=tg; f(nr2,nc2)=tg+norm([gc-nc2, gr-nr2]);
+        end
+    end
+    path=[];
+end
+
+function tf = dynBlocks(path,pos,dyn,ld,blockMargin)
+    if isempty(path), tf=true; return; end
+    [~,i0]=min(vecnorm(path-pos,2,2));
+    seg=path(i0:end,:); d=[0; cumsum(vecnorm(diff(seg),2,2))];
+    pts=seg(d<=ld,:);
+    if isempty(pts), pts=seg(1:min(3,size(seg,1)),:); end
+    tf=min(vecnorm(pts-dyn.pos,2,2)) < (dyn.r + blockMargin);
+end
+
+function out = addCircObs(occ,pos,r)
+    out=occ;
+    for row=1:size(occ,1)
+        for col=1:size(occ,2)
+            if norm([col row]-pos)<=r, out(row,col)=1; end
+        end
+    end
+end
+
+function p = snapFree(occ,p,lbl)
+    p=round(p); nR=size(occ,1); nC=size(occ,2);
+    c=clamp(p(1),1,nC); r=clamp(p(2),1,nR);
+    if occ(r,c)==0, p=[c r]; return; end
+    fprintf('[WARN] %s [%d %d] on wall — snapping.\n',lbl,c,r);
+    for rad=1:max(nR,nC)
+        for dc=-rad:rad
+            for dr=-rad:rad
+                nc=c+dc; nr=r+dr;
+                if nc<1||nc>nC||nr<1||nr>nR, continue; end
+                if occ(nr,nc)==0, p=[nc nr]; return; end
+            end
+        end
+    end
+    error('No free cell near %s.',lbl);
+end
+
+function y = clamp(x,lo,hi), y=max(lo,min(hi,x)); end
+function a = wrapPi(a), a=mod(a+pi,2*pi)-pi; end
+
+function drawRobot(s,sc)
+    th=s(3); tri=sc*[1 0;-0.6 0.4;-0.6 -0.4];
+    R=[cos(th) -sin(th); sin(th) cos(th)];
+    pts=(R*tri')'+[s(1) s(2)];
+    patch(pts(:,1),pts(:,2),[0.2 0.6 0.2],'FaceAlpha',0.85,'EdgeColor','k');
+end
